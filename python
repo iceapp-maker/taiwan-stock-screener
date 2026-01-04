@@ -1,0 +1,1425 @@
+import requests
+from bs4 import BeautifulSoup
+import ipywidgets as widgets
+from IPython.display import display, clear_output
+import re
+import pandas as pd
+import yfinance as yf
+import matplotlib.pyplot as plt
+import os
+import matplotlib.font_manager as fm
+import matplotlib # Explicitly import matplotlib
+import datetime # Import datetime module
+import random
+from concurrent.futures import ThreadPoolExecutor, as_completed # Import as_completed here
+import io
+from tqdm.notebook import tqdm # Changed to tqdm.notebook for better Colab integration
+import time # Import time module for delays
+
+# Install mplfinance if it's not already installed
+try:
+    import mplfinance as mpf
+except ImportError:
+    !pip install mplfinance
+    import mplfinance as mpf
+
+# --- Font setup - Direct download and load Chinese font ---
+
+# Download the font (redirect output to /dev/null to keep it clean)
+!wget -O TaipeiSansTCBeta-Regular.ttf https://drive.google.com/uc?id=1eGAsTN1HBpJAkeVM57_C7ccp7hbgSz3_&export=download > /dev/null 2>&1
+print("TaipeiSansTCBeta-Regular.ttf downloaded.")
+
+# Clear Matplotlib font cache files to ensure the new font is recognized
+cache_dir = matplotlib.get_cachedir()
+if cache_dir and os.path.exists(cache_dir):
+    for filename in os.listdir(cache_dir):
+        # Only remove font cache files, not other matplotlib cache files
+        if filename.startswith('font'):
+            try:
+                os.remove(os.path.join(cache_dir, filename))
+            except OSError as e:
+                print(f"Error removing cached font file {filename}: {e}")
+
+# Explicitly rebuild font cache by loading font manager without cache
+fm._load_fontmanager(try_read_cache=False)
+print("Matplotlib font cache rebuilt.")
+
+# Add the downloaded font to FontManager
+fm.fontManager.addfont('TaipeiSansTCBeta-Regular.ttf')
+
+# Set Matplotlib parameters to use the new font
+font_name = 'Taipei Sans TC Beta' # The family name of the downloaded font
+
+# Ensure the detected font is the very first one in the list for font.sans-serif
+# Include other common sans-serif fonts as fallbacks
+plt.rcParams['font.sans-serif'] = [font_name] + ['DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Arial', 'Helvetica', 'Avant Garde', 'sans-serif']
+plt.rcParams['axes.unicode_minus'] = False # Solve minus sign display issue
+print(f"Matplotlib will use '{font_name}' for Chinese character display.")
+
+# --- Define All Strategy and Helper Functions ---
+
+def _download_and_process_single_stock(yf_ticker_with_suffix):
+    stock_code_plain = yf_ticker_with_suffix.replace('.TW', '')
+    max_retries = 3
+    data = pd.DataFrame()
+
+    today = datetime.date.today()
+    # Calculate start date for 1.5 years ago
+    start_date = today - datetime.timedelta(days=int(1.5 * 365.25))
+
+    for attempt in range(max_retries):
+        try:
+            ticker = yf.Ticker(yf_ticker_with_suffix)
+            data = ticker.history(start=start_date, auto_adjust=True)
+            if not data.empty: # If data is successfully fetched, break the retry loop
+                break
+        except Exception as e:
+            # print(f"Error fetching data for {yf_ticker_with_suffix} (attempt {attempt+1}/{max_retries}): {e})") # Uncomment for debug
+            if attempt < max_retries - 1:
+                time.sleep(random.uniform(0.5, 2)) # Random delay before retry
+            else:
+                return None, None, None # Return None if all retries fail
+
+    if data.empty:
+        return None, None, None
+
+    # Fallback for 'Close' column
+    if 'Close' not in data.columns and 'Adj Close' in data.columns:
+        data['Close'] = data['Adj Close']
+
+    required_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
+    if not all(col in data.columns for col in required_cols):
+        return None, None, None
+
+    weekly_data = data.resample('W').agg({
+        'Open': 'first',
+        'High': 'max',
+        'Low': 'min',
+        'Close': 'last',
+        'Volume': 'sum'
+    }).dropna()
+
+    if weekly_data.empty:
+        return None, None, None
+
+    # Ensure enough data points for SMA_20 calculation (20 weeks minimum for SMA_20, 15 for SMA_15) and MACD (26+9-1=34 weeks minimum for MACD_Histogram)
+    if len(weekly_data) < 34: # Updated to 34 weeks for MACD calculation
+        return None, None, None
+
+    weekly_data['SMA_20'] = weekly_data['Close'].rolling(window=20).mean()
+    weekly_data['STD_20'] = weekly_data['Close'].rolling(window=20).std()
+    weekly_data['Upper_Band'] = weekly_data['SMA_20'] + (weekly_data['STD_20'] * 2)
+    weekly_data['Lower_Band'] = weekly_data['SMA_20'] - (weekly_data['STD_20'] * 2)
+    weekly_data['SMA_15'] = weekly_data['Close'].rolling(window=15).mean()
+
+    # Calculate EMA for MACD
+    weekly_data['EMA_12'] = weekly_data['Close'].ewm(span=12, adjust=False).mean()
+    weekly_data['EMA_26'] = weekly_data['Close'].ewm(span=26, adjust=False).mean()
+
+    # Calculate MACD Line
+    weekly_data['MACD_Line'] = weekly_data['EMA_12'] - weekly_data['EMA_26']
+
+    # Calculate Signal Line
+    weekly_data['Signal_Line'] = weekly_data['MACD_Line'].ewm(span=9, adjust=False).mean()
+
+    # Calculate MACD Histogram
+    weekly_data['MACD_Histogram'] = weekly_data['MACD_Line'] - weekly_data['Signal_Line']
+
+    # Drop rows with NaN values introduced by rolling window calculations and EMA calculations
+    weekly_data.dropna(inplace=True)
+
+    if weekly_data.empty: # Check if all data was dropped due to NaNs after MACD calculations
+        return None, None, None
+
+    last_week_data = weekly_data.iloc[-1]
+
+    # Updated NaN check to include SMA_15, Upper_Band, Lower_Band, and all MACD indicators
+    if (pd.isna(last_week_data['SMA_20']) or pd.isna(last_week_data['Upper_Band']) or pd.isna(last_week_data['Lower_Band']) or
+        pd.isna(last_week_data['SMA_15']) or pd.isna(last_week_data['MACD_Line']) or pd.isna(last_week_data['Signal_Line']) or
+        pd.isna(last_week_data['MACD_Histogram'])):
+        return None, None, None
+
+    technical_info = {
+        '股票代號': stock_code_plain,
+        '最新週開盤價': last_week_data['Open'],
+        '最新週收盤價': last_week_data['Close'],
+        '最新週20日均線': last_week_data['SMA_20'],
+        '最新週15日均線': last_week_data['SMA_15'],
+        '最新週布林通道上緣': last_week_data['Upper_Band'],
+        '最新週布林通道下緣': last_week_data['Lower_Band'],
+        '最新週成交量(張)': last_week_data['Volume'] / 1000, # Divided by 1000 to represent '張' (lots)
+        '最新週MACD線': last_week_data['MACD_Line'],
+        '最新週Signal線': last_week_data['Signal_Line'],
+        '最新週MACD柱狀圖': last_week_data['MACD_Histogram']
+    }
+
+    return stock_code_plain, weekly_data, technical_info
+
+def strategy_one(df_technical_data, all_weekly_data_dfs, min_price, max_price):
+    """
+    根據指定的價格區間和未回補向下跳空破口條件篩選股票。
+
+    參數:
+    df_technical_data (pd.DataFrame): 包含股票最新技術指標數據的 DataFrame。
+    all_weekly_data_dfs (dict): 包含所有股票完整歷史週數據的字典，key為股票代號，value為其週數據DataFrame。
+    min_price (int/float): 最低股票價格。
+    max_price (int/float): 最高股票價格。
+
+    返回:
+    pd.DataFrame: 符合所有篩選條件的股票 DataFrame。
+    """
+    # 1. 初始化一個空列表來儲存符合條件的股票代號。
+    filtered_stock_codes = []
+
+    # 2. 篩選 df_technical_data 中符合 min_price 和 max_price 價格區間的股票，作為初步篩選對象。
+    price_filtered_stocks = df_technical_data[
+        (df_technical_data['最新週收盤價'] >= min_price) &
+        (df_technical_data['最新週收盤價'] <= max_price)
+    ].copy()
+
+    # 3. 遍歷這些初步篩選後的股票
+    for stock_code in price_filtered_stocks['股票代號']:
+        # a. 從 all_weekly_data_dfs 中獲取該股票的完整歷史週數據 (DataFrame)。
+        if stock_code not in all_weekly_data_dfs:
+            continue
+        weekly_data = all_weekly_data_dfs[stock_code]
+
+        # b. 檢查該股票的歷史週數據是否有足夠的資料（至少兩週）來進行破口檢測。
+        if len(weekly_data) < 2:
+            continue
+
+        found_gap = False
+        # c. 遍歷該股票的歷史週數據（從第二週開始，因為需要比較前一週的數據）。
+        for i in range(1, len(weekly_data)):
+            previous_week = weekly_data.iloc[i-1]
+            current_week = weekly_data.iloc[i]
+
+            previous_week_Close = previous_week['Close']
+            previous_week_Low = previous_week['Low']
+            current_week_Open = current_week['Open']
+
+            # d. 對於每一週，檢查以下條件是否滿足：
+            # i. 當週的開盤價 (current_week_Open) 是否低於前一週的最低價 (previous_week_Low)。
+            if current_week_Open < previous_week_Low:
+                # ii. 計算向下跳空破口的大小：gap_size_percentage = (previous_week_Low - current_week_Open) / previous_week_Close。
+                if previous_week_Close == 0: # Avoid division by zero
+                    continue
+                gap_size_percentage = (previous_week_Low - current_week_Open) / previous_week_Close
+
+                # iii. 判斷 gap_size_percentage 是否大於或等於 0.10 (即10%)。
+                if gap_size_percentage >= 0.10:
+                    # e. 如果上述向下跳空破口條件都滿足，則進一步檢查從破口形成當週到最新一週的所有後續K線：
+                    # i. 確認這些後續週的最高價 (subsequent_week_High) 都沒有高於破口範圍的上限 (previous_week_Low),
+                    #    這表示破口尚未被回補。
+                    gap_unfilled = True
+                    # Check from the current week (where gap formed) until the latest week
+                    for j in range(i, len(weekly_data)):
+                        if weekly_data.iloc[j]['High'] > previous_week_Low:
+                            gap_unfilled = False
+                            break
+
+                    if gap_unfilled:
+                        # f. 如果在任何一個歷史時間點找到符合「有向下破口且未被回補」以及10%區間大小條件的股票,
+                        #    則將該股票代號添加到結果列表中並停止對該股票的檢查，繼續處理下一支股票。
+                        filtered_stock_codes.append(stock_code)
+                        found_gap = True
+                        break # Break from inner loop (checking weeks for current stock)
+
+            if found_gap:
+                break # Break from outer loop (checking weeks for current stock)
+
+    # 4. 根據收集到的股票代號，從 df_technical_data 中篩選出最終符合條件的股票DataFrame並返回。
+    final_filtered_stocks = df_technical_data[df_technical_data['股票代號'].isin(filtered_stock_codes)].copy()
+    return final_filtered_stocks
+
+def strategy_two(df_technical_data, all_weekly_data_dfs, min_price, max_price):
+    """
+    根據指定的價格區間和技術指標條件篩選股票 (噴發預警策略)。
+
+    條件:
+    1. 價格區間篩選：股票的最新週收盤價必須在 min_price 和 max_price 之間。
+    2. 成交量持續放大：最近一週的成交量高於前一週的成交量，且前一週的成交量高於前兩週的成交量。
+    3. 股價站穩20週均線之上：最新一週的收盤價必須高於其20週移動平均線。
+    4. K線形態為紅K線：最新一週的收盤價高於其開盤價。
+
+    參數:
+    df_technical_data (pd.DataFrame): 包含股票最新技術指標數據的 DataFrame。
+    all_weekly_data_dfs (dict): 包含所有股票完整歷史週數據的字典，key為股票代號，value為其週數據DataFrame。
+    min_price (int/float): 最低股票價格。
+    max_price (int/float): 最高股票價格。
+
+    返回:
+    pd.DataFrame: 符合所有篩選條件的股票 DataFrame。
+    """
+    # 1. 初始化一個空列表來儲存符合條件的股票代號。
+    filtered_stock_codes = []
+
+    # 2. 篩選 df_technical_data 中符合價格區間、20週均線之上、紅K線的股票。
+    # 使用 .copy() 避免 SettingWithCopyWarning
+    initial_filtered_stocks = df_technical_data[
+        (df_technical_data['最新週收盤價'] >= min_price) &
+        (df_technical_data['最新週收盤價'] <= max_price) &
+        (df_technical_data['最新週收盤價'] > df_technical_data['最新週20日均線']) &
+        (df_technical_data['最新週收盤價'] > df_technical_data['最新週開盤價'])
+    ].copy()
+
+    # 3. 遍歷這些初步篩選後的股票
+    for stock_code in initial_filtered_stocks['股票代號']:
+        if stock_code not in all_weekly_data_dfs:
+            continue
+        weekly_data = all_weekly_data_dfs[stock_code]
+
+        # 確保有足夠的歷史數據（至少三週，即最新的週及其前兩週）來進行成交量比較。
+        # 如果只有一週的數據，iloc[-1] 是最新週，iloc[-2] 是前一週，iloc[-3] 是前兩週。
+        # 所以需要至少 3 週的數據
+        if len(weekly_data) < 3:
+            continue
+
+        # 獲取最近三週的成交量數據
+        latest_week_volume = weekly_data['Volume'].iloc[-1]
+        previous_week_volume = weekly_data['Volume'].iloc[-2]
+        two_weeks_ago_volume = weekly_data['Volume'].iloc[-3]
+
+        # 檢查成交量是否持續放大趨勢
+        if (latest_week_volume > previous_week_volume) and \
+           (previous_week_volume > two_weeks_ago_volume):
+            filtered_stock_codes.append(stock_code)
+
+    # 4. 根據收集到的股票代號，從 df_technical_data 中篩選出最終符合條件的股票DataFrame並返回。
+    final_filtered_stocks = df_technical_data[df_technical_data['股票代號'].isin(filtered_stock_codes)].copy()
+    return final_filtered_stocks
+
+def strategy_three(df_technical_data, all_weekly_data_dfs, min_price, max_price):
+    """
+    根據指定的價格區間和技術指標條件篩選股票 (布林通道緊縮後K棒突破策略)。
+
+    條件:
+    1. 價格區間篩選：股票的最新週收盤價必須在 min_price 和 max_price 之間。
+    2. 布林通道緊縮：過去 12 週 (不含最新一週) 的布林通道平均寬度，相對於該期間平均收盤價的比例小於 5%。
+    3. K棒突破：最新一週的收盤價高於前一週的最高價，且最新一週為紅K線 (收盤價 > 開盤價)。
+    4. 成交量確認：最新一週的成交量至少是前4週平均成交量的 1.5 倍。
+
+    參數:
+    df_technical_data (pd.DataFrame): 包含股票最新技術指標數據的 DataFrame。
+    all_weekly_data_dfs (dict): 包含所有股票完整歷史週數據的字典，key為股票代號，value為其週數據DataFrame。
+    min_price (int/float): 最低股票價格。
+    max_price (int/float): 最高股票價格。
+
+    返回:
+    pd.DataFrame: 符合所有篩選條件的股票 DataFrame。
+    """
+    filtered_stock_codes = []
+
+    price_filtered_stocks = df_technical_data[
+        (df_technical_data['最新週收盤價'] >= min_price) &
+        (df_technical_data['最新週收盤價'] <= max_price)
+    ].copy()
+
+    for stock_code in price_filtered_stocks['股票代號']:
+        if stock_code not in all_weekly_data_dfs:
+            continue
+        weekly_data = all_weekly_data_dfs[stock_code]
+
+        # 需要至少 20 週的數據來計算布林通道 (SMA_20) 以及 12 週的歷史數據 + 最新一週 + 前一週高點
+        # 因此需要至少 20 週數據，並且確保沒有NaN值
+        if len(weekly_data) < 20 or weekly_data[['SMA_20', 'Upper_Band', 'Lower_Band']].isnull().values.any():
+            continue
+
+        latest_week = weekly_data.iloc[-1] # 最新一週數據
+        previous_week = weekly_data.iloc[-2] # 前一週數據
+        prior_12_weeks_data = weekly_data.iloc[-13:-1] # 前12週數據，不包含最新一週
+        prior_4_weeks_volume_data = weekly_data.iloc[-5:-1] # 前4週數據，不包含最新一週
+
+        # 條件2: 布林通道緊縮 (過去 12 週)
+        # 確保 prior_12_weeks_data 包含足夠的非 NaN 布林通道數據
+        prior_12_weeks_data_cleaned_bb = prior_12_weeks_data.dropna(subset=['Upper_Band', 'Lower_Band', 'Close'])
+        if prior_12_weeks_data_cleaned_bb.empty:
+            continue
+
+        bb_widths_12_weeks = prior_12_weeks_data_cleaned_bb['Upper_Band'] - prior_12_weeks_data_cleaned_bb['Lower_Band']
+        avg_bb_width_12_weeks = bb_widths_12_weeks.mean()
+        avg_close_12_weeks = prior_12_weeks_data_cleaned_bb['Close'].mean()
+
+        is_bb_squeezed_over_period = False
+        if avg_close_12_weeks > 0:
+            # 將布林通道緊縮閾值從 10% 改為 5%
+            is_bb_squeezed_over_period = (avg_bb_width_12_weeks / avg_close_12_weeks) < 0.05 # 5% 閾值
+
+        if is_bb_squeezed_over_period:
+            condition_met = True
+
+        # 條件3: K棒突破
+        is_red_candlestick = latest_week['Close'] > latest_week['Open'] # 最新一週為紅K線
+        is_breakout_above_previous_high = latest_week['Close'] > previous_week['High'] # 最新收盤價高於前一週最高價
+        is_k_bar_breakout = is_red_candlestick and is_breakout_above_previous_high
+
+        # 條件4: 成交量確認
+        prior_4_weeks_volume_data = weekly_data.iloc[-5:-1]
+        prior_4_weeks_avg_volume = prior_4_weeks_volume_data['Volume'].mean()
+        is_volume_confirmed = False
+        if not pd.isna(prior_4_weeks_avg_volume) and prior_4_weeks_avg_volume > 0:
+            is_volume_confirmed = latest_week['Volume'] >= (prior_4_weeks_avg_volume * 1.5) # 1.5 倍的閾值
+
+        # 所有條件都滿足
+        if is_bb_squeezed_over_period and is_k_bar_breakout and is_volume_confirmed:
+            filtered_stock_codes.append(stock_code)
+
+    final_filtered_stocks = df_technical_data[df_technical_data['股票代號'].isin(filtered_stock_codes)].copy()
+    return final_filtered_stocks
+
+# 5. Define plot_candlestick_chart function
+def plot_candlestick_chart(stock_selection_string):
+    # print(f"DEBUG: plot_candlestick_chart function called for: '{stock_selection_string}'.") # Removed debug
+    global all_weekly_data_dfs
+    global global_selected_conditions_for_plot # Access global variable for selected conditions
+
+    if not stock_selection_string:
+        # print("DEBUG: 無股票選擇。請選擇一支股票來繪製K線圖。 (stock_selection_string is empty)") # Removed debug
+        return None # Return None to clear any previous plot if no stock is selected
+
+    # Split the string to get stock code and name
+    parts = stock_selection_string.split(' - ')
+    stock_code_display = parts[0]
+    stock_name_display = parts[1] if len(parts) > 1 else ''
+
+    # Retrieve weekly_data from the global dictionary instead of re-fetching
+    if stock_code_display not in all_weekly_data_dfs:
+        # print(f"DEBUG: 錯誤: 無法找到 {stock_code_display} 的週數據。 (Not in all_weekly_data_dfs)") # Removed debug
+        return None
+
+    weekly_data = all_weekly_data_dfs[stock_code_display].copy() # Use .copy() to avoid SettingWithCopyWarning
+
+    if weekly_data.empty: # This check is still valid if all_weekly_data_dfs somehow has empty dataframes
+        print(f"警告: {stock_code_display} 的週數據為空，無法繪製K線圖。")
+        return None
+
+    # Adding a minimum row check for plotting robustness
+    if len(weekly_data) < 5: # mplfinance needs enough bars to draw meaningful candles, typically > 1, but 5 is safer.
+        print(f"警告: {stock_code_display} 的週數據不足 {len(weekly_data)} 筆，無法繪製有意義的K線圖。至少需要5筆數據。")
+        return None
+
+    # The _download_and_process_single_stock function already ensures at least 34 weeks of data and calculates all necessary indicators.
+    # Thus, no need to recalculate SMA/Bollinger Bands or dropna() again here.
+
+    # Ensure the required columns for plotting exist. If they don't, it means _download_and_process_single_stock failed or data is corrupted.
+    required_plot_cols = ['SMA_20', 'SMA_15', 'Upper_Band', 'Lower_Band']
+    if not all(col in weekly_data.columns for col in required_plot_cols): # This checks for column *existence*.
+        print(f"警告: {stock_code_display} 的繪圖所需技術指標數據缺失，無法繪製K線圖。")
+        return None
+
+    # --- Debug: Print tail of weekly_data before plotting ---
+    # print(f"--- {stock_code_display} 週數據 (尾部) ---\n{weekly_data.tail()}\n----------------------------------")
+
+    my_mplfinance_style = mpf.make_mpf_style(
+        base_mpf_style='yahoo',
+        rc={'font.family': [font_name, 'sans-serif'], 'axes.unicode_minus': False,
+            'figure.titlesize': 24, # Adjust these values for desired font size
+            'axes.labelsize': 20,   # Adjust these values for desired font size
+            'xtick.labelsize': 16,  # Adjust these values for desired font size
+            'ytick.labelsize': 16   # Adjust these values for desired font size
+           },
+        y_on_right=False
+    )
+
+    apds = []
+    max_panel_idx = 0 # Track the highest panel index used, 0 for main chart
+
+    # Add SMA/BB plots if their series are valid (all go to panel 0)
+    if not weekly_data['SMA_20'].empty and not weekly_data['SMA_20'].isnull().all():
+        apds.append(mpf.make_addplot(weekly_data['SMA_20'], panel=0, color='blue', linestyle='-', width=0.7,  ylabel='SMA'))
+    # else: # Removed noisy warning
+    #     print(f"警告: {stock_code_display} 的SMA_20數據缺失或不完整，無法繪製。")
+
+    if not weekly_data['SMA_15'].empty and not weekly_data['SMA_15'].isnull().all():
+        apds.append(mpf.make_addplot(weekly_data['SMA_15'], panel=0, color='orange', linestyle='-', width=0.7))
+    # else: # Removed noisy warning
+    #     print(f"警告: {stock_code_display} 的SMA_15數據缺失或不完整，無法繪製。")
+
+    if not weekly_data['Upper_Band'].empty and not weekly_data['Upper_Band'].isnull().all():
+        apds.append(mpf.make_addplot(weekly_data['Upper_Band'], panel=0, color='red', linestyle='--', width=0.5, ylabel='Bollinger Bands'))
+    # else: # Removed noisy warning
+    #     print(f"警告: {stock_code_display} 的布林通道上緣數據缺失或不完整，無法繪製。")
+
+    if not weekly_data['Lower_Band'].empty and not weekly_data['Lower_Band'].isnull().all():
+        apds.append(mpf.make_addplot(weekly_data['Lower_Band'], panel=0, color='green', linestyle='--', width=0.5))
+    # else: # Removed noisy warning
+    #     print(f"警告: {stock_code_display} 的布林通道下緣數據缺失或不完整，無法繪製。")
+
+    # Conditionally add MACD plots if 's_macd_slowly_climbing' is selected
+    if 's_macd_slowly_climbing' in global_selected_conditions_for_plot:
+        has_macd_cols = all(col in weekly_data.columns for col in ['MACD_Line', 'Signal_Line', 'MACD_Histogram'])
+        if has_macd_cols:
+            macd_line_ok = not weekly_data['MACD_Line'].empty and not weekly_data['MACD_Line'].isnull().all()
+            signal_line_ok = not weekly_data['Signal_Line'].empty and not weekly_data['Signal_Line'].isnull().all()
+            histogram_ok = not weekly_data['MACD_Histogram'].empty and not weekly_data['MACD_Histogram'].isnull().all()
+
+            if macd_line_ok and signal_line_ok: # MACD line and Signal line share panel 1
+                apds.append(mpf.make_addplot(weekly_data['MACD_Line'], panel=1, color='purple', width=0.7, ylabel='MACD'))
+                apds.append(mpf.make_addplot(weekly_data['Signal_Line'], panel=1, color='pink', width=0.7))
+                max_panel_idx = max(max_panel_idx, 1)
+            else:
+                print(f"警告: {stock_code_display} 的MACD線或Signal線數據缺失或不完整，無法繪製。")
+
+            if histogram_ok: # MACD Histogram gets panel 2
+                apds.append(mpf.make_addplot(weekly_data['MACD_Histogram'], panel=2, type='bar', color='grey', width=0.7, ylabel='Histogram'))
+                max_panel_idx = max(max_panel_idx, 2)
+            else:
+                print(f"警告: {stock_code_display} 的MACD柱狀圖數據缺失或不完整，無法繪製。")
+        else:
+            print(f"警告: {stock_code_display} 的MACD指標列不存在，無法繪製MACD圖表。")
+
+    # Dynamically build plot_panel_ratios based on max_panel_idx
+    # Default main OHLC has panel 0 with ratio 4.
+    # Each subsequent panel (1, 2, ...) gets a ratio of 1.
+    # If max_panel_idx is 0, plot_panel_ratios will be [4].
+    # If max_panel_idx is 1, plot_panel_ratios will be [4, 1].
+    # If max_panel_idx is 2, plot_panel_ratios will be [4, 1, 1].
+    plot_panel_ratios = [4] + [1] * max_panel_idx
+
+    # print(f"DEBUG: Attempting to plot K-line chart for {stock_code_display}.") # Removed debug
+    title_text = f"{stock_code_display} {stock_name_display} 週K線圖 (含20/15週均線與布林通道)" # Updated title
+    # print(f"DEBUG: Chart title generated: {title_text}") # Removed debug
+
+    try:
+        fig, axlist = mpf.plot(weekly_data, type='candle', style=my_mplfinance_style,
+                               addplot=apds,
+                               title=title_text,
+                               ylabel='股價',
+                               ylabel_lower='', # Remove ylabel for volume
+                               volume=False, # Set volume to False
+                               figscale=1.5, # Reverted figscale to a moderate value
+                               returnfig=True,
+                               panel_ratios=plot_panel_ratios) # Pass dynamic panel_ratios
+        # print(f"DEBUG: Successfully created K-line chart for {stock_code_display}.") # Removed debug
+        return fig
+
+    except Exception as e:
+        import traceback
+        print(f"繪製 {stock_code_display} K線圖時發生錯誤: {e}") # Keep user-facing error
+        # print(traceback.format_exc()) # Removed debug traceback for user
+        return None
+
+# 6. Function to fetch and process stock data
+def get_and_process_stock_data(selected_category_val):
+    target_url = "https://isin.twse.com.tw/isin/class_main.jsp"
+    request_payload = {}
+
+    if selected_category_val == '全部上市':
+        target_url = "https://isin.twse.com.tw/isin/class_main.jsp?owncode=&stockname=&isincode=&market=1&issuetype=1&industry_code=&Page=1&chklike=Y"
+        response = requests.get(target_url) # Use GET for '全部上市'
+    else:
+        industry_code_match = re.match(r'^(\d+)\.', selected_category_val)
+        if industry_code_match:
+            industry_code = industry_code_match.group(1)
+            request_payload = {
+                'market': '1',
+                'industry_code': industry_code
+            }
+            response = requests.get(target_url, params=request_payload) # Changed to GET to match other parts. Was POST.
+        else:
+            print(f"錯誤: 無法從 '{selected_category_val}' 提取產業代碼。")
+            return pd.DataFrame(), pd.DataFrame(), {}
+
+    df_stocks = pd.DataFrame()
+    extracted_stock_info = pd.DataFrame()
+
+    if response.status_code == 200:
+        soup = BeautifulSoup(response.text, 'html.parser')
+        all_tables = soup.find_all('table')
+
+        if len(all_tables) > 1:
+            stock_table = all_tables[1]
+
+            rows = stock_table.find_all('tr')
+            stock_data_raw = []
+
+            headers = [
+                '序號',
+                '有價證券國際證券編碼',
+                '有價證券代號',
+                '有價證券名稱',
+                '市場別',
+                '種別',
+                '產業別',
+                '公開發行/上市(櫃)日',
+                'CFICode',
+                '備註'
+            ]
+
+            if rows:
+                for i, row in enumerate(rows):
+                    cols = row.find_all('td')
+                    cols_text = [ele.get_text(strip=True) for ele in cols]
+                    if any(cols_text) and len(cols_text) == len(headers):
+                        stock_data_raw.append(cols_text)
+
+                if stock_data_raw:
+                    df_stocks = pd.DataFrame(stock_data_raw, columns=headers)
+
+    if not df_stocks.empty:
+        extracted_stock_info = df_stocks.iloc[1:].copy()
+        extracted_stock_info = extracted_stock_info[['有價證券代號', '有價證券名稱']].copy()
+        extracted_stock_info.insert(0, '項次', range(1, 1 + len(extracted_stock_info)))
+        extracted_stock_info.rename(columns={
+            '有價證券代號': '股票代號',
+            '有價證券名稱': '股票名稱'
+        }, inplace=True)
+
+        # Add 'yf_ticker' column by appending '.TW' to '股票代號'
+        extracted_stock_info['yf_ticker'] = extracted_stock_info['股票代號'] + '.TW'
+
+    # Initialize empty lists and dictionaries to store results
+    stock_technical_data = []
+    all_weekly_data_dfs = {}
+
+    if not extracted_stock_info.empty:
+        yf_tickers_to_process = extracted_stock_info['yf_ticker'].tolist()
+        # Use ThreadPoolExecutor for concurrent downloading
+        # max_workers=3 is a reasonable number to avoid overwhelming yfinance servers
+
+        # Display the progress bar in its own output area
+        with progress_output_area:
+            progress_output_area.layout.display = 'block' # Ensure the output widget is visible
+            clear_output(wait=True) # Clear previous progress bar if any
+            with ThreadPoolExecutor(max_workers=3) as executor:
+                # Submit tasks and display a progress bar using tqdm
+                future_to_ticker = {executor.submit(_download_and_process_single_stock, yf_ticker):
+                                    yf_ticker for yf_ticker in yf_tickers_to_process}
+
+                # tqdm is used to wrap as_completed, providing a progress bar
+                for future in tqdm(as_completed(future_to_ticker.keys()),
+                                   total=len(yf_tickers_to_process),
+                                   desc="Downloading historical data", leave=False):
+                    stock_code_plain, weekly_data, technical_info = future.result()
+                    if stock_code_plain and not weekly_data.empty and technical_info:
+                        all_weekly_data_dfs[stock_code_plain] = weekly_data
+                        stock_technical_data.append(technical_info)
+            clear_output(wait=True) # Clear the progress bar after it's done
+            progress_output_area.layout.display = 'none' # Hide the output widget
+
+    return extracted_stock_info, pd.DataFrame(stock_technical_data), all_weekly_data_dfs
+
+def dynamic_stock_screener(selected_condition_keys, df_technical_data, all_weekly_data_dfs, min_price, max_price):
+    """
+    根據用戶選定的條件動態篩選股票。
+
+    參數:
+    selected_condition_keys (list): 包含用戶選定條件鍵的列表。
+    df_technical_data (pd.DataFrame): 包含股票最新技術指標數據的 DataFrame。
+    all_weekly_data_dfs (dict): 包含所有股票完整歷史週數據的字典，key為股票代號，value為其週數據DataFrame。
+    min_price (int/float): 最低股票價格。
+    max_price (int/float): 最高股票價格。
+
+    返回:
+    pd.DataFrame: 符合所有選定條件的股票 DataFrame。
+    """
+    # 1. 初始化一個空列表來儲存符合條件的股票代號。
+    filtered_stock_codes = []
+
+    # 2. 處理價格區間篩選 (如果選中了 "price_range")
+    candidate_stocks = df_technical_data.copy()
+    if "price_range" in selected_condition_keys:
+        candidate_stocks = candidate_stocks[
+            (candidate_stocks['最新週收盤價'] >= min_price) &
+            (candidate_stocks['最新週收盤價'] <= max_price)
+        ].copy()
+
+    # 3. 遍歷這些候選股票
+    for stock_code in candidate_stocks['股票代號']:
+        if stock_code not in all_weekly_data_dfs:
+            continue
+        weekly_data = all_weekly_data_dfs[stock_code]
+
+        # 檢查是否有足夠的數據進行所有可能的條件判斷
+        # For s5_double_bottom_red_k_unbroken_high, we need at least 27 weeks.
+        # The new S5 trend check on SMA_15 needs 15 weeks for SMA_15 itself,
+        # and then diff().iloc[-6:] needs at least 6 data points. So 15 + (6-1) = 20 weeks for that particular check.
+        # S6 needs SMA_20 and SMA_15 for 5 weeks lookback (max(20,15)+5 = 25 weeks) and 9 weeks for volume.
+        # Currently, S5 is still the most demanding with 27 weeks.
+        # However, MACD calculations (EMA_26 and then Signal Line) require more data, up to 26+9-1 = 34 weeks.
+        if len(weekly_data) < 34: # Set minimum data requirement to 34 weeks for MACD and other strategies
+            stock_meets_all_conditions = False
+            continue
+
+        # 獲取常用數據點
+        latest_week = weekly_data.iloc[-1]
+        previous_week = weekly_data.iloc[-2] if len(weekly_data) >= 2 else None
+        two_weeks_ago = weekly_data.iloc[-3] if len(weekly_data) >= 3 else None
+        three_weeks_ago = weekly_data.iloc[-4] if len(weekly_data) >= 4 else None # Needed for S4
+        four_weeks_ago = weekly_data.iloc[-5] if len(weekly_data) >= 5 else None # Needed for MACD climbing
+
+        # 設置一個標誌，用於檢查當前股票是否滿足所有選定條件
+        stock_meets_all_conditions = True
+
+        # 遍歷所有選定的條件鍵並應用其邏輯
+        for condition_key in selected_condition_keys:
+            # 跳過 price_range，因為它已經在前面處理過了
+            if condition_key == "price_range":
+                continue
+
+            condition_met = False
+
+            # --- 條件檢查邏輯 ---
+            if condition_key == "s1_downward_gap_unfilled":
+                if len(weekly_data) < 2:
+                    stock_meets_all_conditions = False
+                    break
+
+                found_gap = False
+                for i in range(1, len(weekly_data)):
+                    prev_week_s1 = weekly_data.iloc[i-1]
+                    curr_week_s1 = weekly_data.iloc[i]
+
+                    if curr_week_s1['Open'] < prev_week_s1['Low']:
+                        if prev_week_s1['Close'] == 0:
+                            continue
+                        gap_size_percentage = (prev_week_s1['Low'] - curr_week_s1['Open']) / prev_week_s1['Close']
+                        if gap_size_percentage >= 0.10:
+                            gap_unfilled = True
+                            for j in range(i, len(weekly_data)):
+                                if weekly_data.iloc[j]['High'] > prev_week_s1['Low']:
+                                    gap_unfilled = False
+                                    break
+                            if gap_unfilled:
+                                found_gap = True
+                                break
+                if found_gap: # Only if a gap was found and unfilled, the condition is met.
+                    condition_met = True
+
+            elif condition_key == "s2_volume_increasing":
+                if two_weeks_ago is None or previous_week is None:
+                    stock_meets_all_conditions = False
+                    break
+                if (latest_week['Volume'] > previous_week['Volume']) and \
+                   (previous_week['Volume'] > two_weeks_ago['Volume']):
+                    condition_met = True
+
+            elif condition_key == "s2_above_20sma":
+                # Ensure SMA_20 is calculated and not NaN
+                if pd.isna(latest_week['SMA_20']):
+                    stock_meets_all_conditions = False
+                    break
+                if latest_week['Close'] > latest_week['SMA_20']:
+                    condition_met = True
+
+            elif condition_key == "s2_red_candlestick":
+                if latest_week['Close'] > latest_week['Open']:
+                    condition_met = True
+
+            # NEW S3 CONDITION: 目前布林通道緊縮
+            elif condition_key == "s3_current_bb_squeeze":
+                # Ensure enough data for SMA_20/BB calculations for the latest week (which needs 20 weeks of data).
+                if len(weekly_data) < 20: # Need at least 20 weeks for BB calculation
+                    stock_meets_all_conditions = False
+                    break
+
+                # Condition: Currently in Bollinger Band squeeze (latest week)
+                is_current_bb_squeezed = False
+                if not pd.isna(latest_week['Upper_Band']) and not pd.isna(latest_week['Lower_Band']) and latest_week['Close'] > 0:
+                    current_bb_width_ratio = (latest_week['Upper_Band'] - latest_week['Lower_Band']) / latest_week['Close']
+                    # Define squeeze threshold, e.g., less than 5% or 10% of close price
+                    is_current_bb_squeezed = (current_bb_width_ratio < 0.05) # Using 5% as a tight threshold
+
+                if is_current_bb_squeezed:
+                    condition_met = True
+
+            elif condition_key == "s4_12w_consolidation_no_recent_surge":
+                # Condition 1: 12-week consolidation (excluding current week)
+                # Need at least 13 weeks of data (12 historical + 1 latest) +
+                # 3 prior for 'no recent surge' means minimum 16 weeks to be safe
+                if len(weekly_data) < 16:
+                    stock_meets_all_conditions = False
+                    break
+
+                # Get data for the past 12 weeks, excluding the latest week
+                # The latest_close is from latest_week, which is not included in past_12_weeks_data
+                past_12_weeks_data = weekly_data.iloc[-13:-1]
+
+                # Check for NaNs in High/Low/Close for the relevant period
+                if past_12_weeks_data[['High', 'Low', 'Close']].isnull().values.any():
+                    stock_meets_all_conditions = False
+                    break
+
+                max_high_12w = past_12_weeks_data['High'].max()
+                min_low_12w = past_12_weeks_data['Low'].min()
+                latest_close = latest_week['Close']
+
+                # Ensure latest_close and min_low_12w are not zero to prevent division by zero
+                if latest_close == 0 or min_low_12w == 0:
+                    stock_meets_all_conditions = False
+                    break
+
+                # Stricter consolidation check:
+                # 1. The entire 12-week high-low range should be within 10% of its own low.
+                consolidation_range_tight_enough = (max_high_12w <= min_low_12w * 1.10)
+
+                # 2. The latest close should also be within this 12-week historical range.
+                latest_close_within_historical_range = (latest_close >= min_low_12w and latest_close <= max_high_12w)
+
+                consolidation_ok = consolidation_range_tight_enough and latest_close_within_historical_range
+
+
+                # Condition 2: No recent surge (latest close vs three weeks ago)
+                # Need at least 4 weeks of data (latest + 3 prior) for three_weeks_ago
+                if three_weeks_ago is None or pd.isna(three_weeks_ago['Close']):
+                    stock_meets_all_conditions = False
+                    break
+
+                three_weeks_ago_close = three_weeks_ago['Close']
+                # Ensure three_weeks_ago_close is not zero to prevent division by zero
+                if three_weeks_ago_close == 0:
+                    stock_meets_all_conditions = False
+                    break
+
+                price_change_from_3w_ago = (latest_close - three_weeks_ago_close) / three_weeks_ago_close
+                no_recent_surge_ok = (price_change_from_3w_ago <= 0.10) # Not risen more than 10%
+
+                if consolidation_ok and no_recent_surge_ok:
+                    condition_met = True
+
+            elif condition_key == "s5_double_bottom_red_k_unbroken_high":
+                # Condition 1: Require at least 27 weeks of historical data (checked at the beginning of the loop)
+                # Get data for the relevant period
+                relevant_data = weekly_data.iloc[:-1] # Exclude current week for B2 search
+
+                # --- Find B2 candle ---
+                # B2: Lowest 'Low' in the last 5 weeks (excluding current week)
+                if len(relevant_data) < 5:
+                    stock_meets_all_conditions = False
+                    break
+
+                recent_5_weeks = relevant_data.iloc[-5:]
+                if recent_5_weeks.empty or recent_5_weeks[['Open', 'Close', 'High', 'Low']].isnull().values.any() or recent_5_weeks['Lower_Band'].isnull().values.any():
+                    stock_meets_all_conditions = False
+                    break
+
+                b2_index = recent_5_weeks['Low'].idxmin()
+                b2_candle = weekly_data.loc[b2_index]
+                b2_candle_idx = weekly_data.index.get_loc(b2_index)
+
+                # B2 must be a red candlestick (Close < Open)
+                is_b2_red_k = b2_candle['Close'] < b2_candle['Open']
+                if not is_b2_red_k:
+                    stock_meets_all_conditions = False
+                    break
+
+                # Calculate lower shadow length and body length
+                # Body: abs(Close - Open)
+                # Lower Shadow: min(Open, Close) - Low
+                b2_body_length = abs(b2_candle['Close'] - b2_candle['Open'])
+                b2_lower_shadow_length = min(b2_candle['Open'], b2_candle['Close']) - b2_candle['Low']
+
+                # Lower shadow length must be at least 50% of the candle's body length
+                if b2_body_length == 0: # Avoid division by zero, consider zero body as no significant body for this ratio
+                    is_b2_lower_shadow_long_enough = False
+                else:
+                    is_b2_lower_shadow_long_enough = b2_lower_shadow_length >= (b2_body_length * 0.5)
+
+                if not is_b2_lower_shadow_long_enough:
+                    stock_meets_all_conditions = False
+                    break
+
+                # New Bollinger Band check: B2's Low is near or below the Lower_Band
+                is_b2_near_lower_band = False
+                if not pd.isna(b2_candle['Lower_Band']) and b2_candle['Lower_Band'] > 0: # Ensure Lower_Band is valid and positive
+                    is_b2_near_lower_band = (b2_candle['Low'] <= b2_candle['Lower_Band'] * 1.01)
+
+                if not is_b2_near_lower_band:
+                    stock_meets_all_conditions = False
+                    break
+
+                # --- Unbroken high after B2 ---
+                # From B2 onwards (including B2), all subsequent candles' 'High' prices must be <= B2's 'High'
+                # This means B2's high should not be broken by any subsequent week's high.
+                # Check from B2_candle_idx + 1 until the latest week
+                subsequent_weeks = weekly_data.iloc[b2_candle_idx + 1:]
+
+                unbroken_high = True
+                if not subsequent_weeks.empty:
+                    if subsequent_weeks['High'].max() > b2_candle['High']:
+                        unbroken_high = False
+
+                if not unbroken_high:
+                    stock_meets_all_conditions = False
+                    break
+
+                # --- Find B1 candle ---
+                # B1: Lowest 'Low' from 26 weeks ago up to just before B2
+                # Range: weekly_data.iloc[max(0, b2_candle_idx - 26) : b2_candle_idx]
+                # Ensure there are enough weeks for B1 search
+                if b2_candle_idx < 26:
+                     stock_meets_all_conditions = False
+                     break
+
+                b1_search_range = weekly_data.iloc[max(0, b2_candle_idx - 26) : b2_candle_idx]
+
+                if b1_search_range.empty or b1_search_range[['Low', 'Lower_Band']].isnull().values.any():
+                    stock_meets_all_conditions = False
+                    break
+
+                b1_index = b1_search_range['Low'].idxmin()
+                b1_candle = weekly_data.loc[b1_index]
+                b1_candle_idx = weekly_data.index.get_loc(b1_index)
+
+                # New Bollinger Band check for B1: B1's Low is near or below the Lower_Band
+                is_b1_near_lower_band = False
+                if not pd.isna(b1_candle['Lower_Band']) and b1_candle['Lower_Band'] > 0: # Ensure Lower_Band is valid and positive
+                    is_b1_near_lower_band = (b1_candle['Low'] <= b1_candle['Lower_Band'] * 1.01)
+
+                if not is_b1_near_lower_band:
+                    stock_meets_all_conditions = False
+                    break
+
+                # --- Confirm B1 and B2 relationship ---
+                # B1's 'Low' is within 5% of B2's 'Low'
+                # Ensure b2_candle['Low'] is not zero for division
+                if b2_candle['Low'] == 0:
+                    stock_meets_all_conditions = False
+                    break
+
+                low_diff_percentage = abs(b1_candle['Low'] - b2_candle['Low']) / b2_candle['Low']
+                is_lows_within_5_percent = low_diff_percentage <= 0.05
+
+                if not is_lows_within_5_percent:
+                    stock_meets_all_conditions = False
+                    break
+
+                # At least 3 weeks between B1 and B2 (exclusive of B1 and B2 themselves)
+                # (b2_candle_idx - b1_candle_idx - 1) gives number of weeks between them
+                weeks_between_b1_b2 = b2_candle_idx - b1_candle_idx - 1
+                is_separated_by_at_least_3_weeks = weeks_between_b1_b2 >= 3
+
+                if not is_separated_by_at_least_3_weeks:
+                    stock_meets_all_conditions = False
+                    break
+
+                # --- Intermediate candles check ---
+                # All candles between B1 and B2 (exclusive of B1 and B2) 的 'body high' (max of Open or Close) 都必須小於或等於其對應的 20 週移動平均線。
+                is_intermediate_candles_ok = True
+                if weeks_between_b1_b2 > 0: # Only check if there are intermediate candles
+                    intermediate_candles_data = weekly_data.iloc[b1_candle_idx + 1 : b2_candle_idx]
+                    if intermediate_candles_data.empty:
+                        is_intermediate_candles_ok = True # No intermediate candles, so condition is met vacuously
+                    else:
+                        if intermediate_candles_data[['Open', 'Close', 'SMA_20']].isnull().values.any():
+                            is_intermediate_candles_ok = False # Data integrity check
+                        else:
+                            for _, candle in intermediate_candles_data.iterrows():
+                                body_high = max(candle['Open'], candle['Close'])
+                                if body_high > candle['SMA_20']:
+                                    is_intermediate_candles_ok = False
+                                    break
+
+                if not is_intermediate_candles_ok:
+                    stock_meets_all_conditions = False
+                    break
+
+                # New S5 Condition: the 15-week moving average for the most recent 6 weeks must not be trending downwards.
+                # This means weekly_data['SMA_15'].diff().iloc[-6:].min() >= 0
+                # Ensure enough data for SMA_15 and then 6 weeks for diff().
+                # SMA_15 needs 15 weeks. diff().iloc[-6:] needs at least 6 values AFTER SMA_15 is calculated.
+                # So, total weeks needed is 15 + (6-1) = 20 weeks minimally to get 6 diff values.
+                if len(weekly_data) < 20:
+                    stock_meets_all_conditions = False
+                    break
+
+                # Check if SMA_15 has any NaN values in the relevant period
+                if weekly_data['SMA_15'].iloc[-6:].isnull().any():
+                    stock_meets_all_conditions = False
+                    break
+
+                is_sma15_not_trending_down_6w = weekly_data['SMA_15'].diff().iloc[-6:].min() >= 0
+
+                if not is_sma15_not_trending_down_6w:
+                    stock_meets_all_conditions = False
+                    break
+
+
+                # All conditions for S5 met
+                condition_met = is_b2_red_k and is_b2_lower_shadow_long_enough and is_b2_near_lower_band and unbroken_high and is_b1_near_lower_band and is_lows_within_5_percent and is_separated_by_at_least_3_weeks and is_intermediate_candles_ok and is_sma15_not_trending_down_6w
+
+            elif condition_key == "s6_momentum_for_potential_gain":
+                # Ensure enough data for SMA_20 and SMA_15 (at least 20 for SMA_20, 15 for SMA_15, 9 for volume avg)
+                # This is already covered by the overall len(weekly_data) check at the beginning of the loop, which is 34 weeks.
+                if pd.isna(latest_week['SMA_20']) or pd.isna(latest_week['SMA_15']):
+                    stock_meets_all_conditions = False
+                    break
+
+                # 1. Latest weekly closing price is above its 15-week Simple Moving Average (SMA_15).
+                is_above_sma15 = (latest_week['Close'] > latest_week['SMA_15'])
+
+                # 2. The 20-week Simple Moving Average (SMA_20) has crossed above the 15-week Simple Moving Average (SMA_15) within the last 5 weeks (inclusive).
+                golden_cross_recent = False
+                # Check from current week (index -1) up to 5 weeks back (index -5)
+                # The iteration range was slightly off, corrected to ensure proper indexing for 'previous' weeks within the loop.
+                for i in range(1, 6): # i=1 for current week, i=5 for 4 weeks ago
+                    current_idx = -i
+                    prev_idx = -i - 1
+
+                    # Ensure enough data for SMA_20 and SMA_15 for the current and previous indices
+                    if len(weekly_data) < (max(20, 15) + i -1):
+                        # Not enough data to calculate SMAs for the current week being checked 'i' weeks ago
+                        continue
+
+                    current_sma20 = weekly_data['SMA_20'].iloc[current_idx]
+                    current_sma15 = weekly_data['SMA_15'].iloc[current_idx]
+
+                    if i == 1: # For the latest week, SMA20 must be above SMA15
+                        if not (current_sma20 > current_sma15):
+                            golden_cross_recent = False # No golden cross if latest SMA20 is not above SMA15
+                            break
+
+                    # Check for the actual cross point within the lookback window (from 5 weeks ago up to previous week)
+                    if i > 1: # Only check for cross if we have a previous week to compare with
+                        if len(weekly_data) < (max(20, 15) + i):
+                             continue # Not enough history for this specific comparison, but might be for earlier weeks
+
+                        previous_sma20 = weekly_data['SMA_20'].iloc[prev_idx]
+                        previous_sma15 = weekly_data['SMA_15'].iloc[prev_idx]
+
+                        # A golden cross occurred if SMA20 was below SMA15 and now it's above.
+                        if (previous_sma20 < previous_sma15) and (current_sma20 > current_sma15):
+                            golden_cross_recent = True
+                            break
+
+                    # Special case for a cross in the current week (i=1) itself
+                    elif i == 1 and (current_sma20 > current_sma15):
+                        if len(weekly_data) >= 2: # Need at least previous week to check for cross
+                            previous_sma20 = weekly_data['SMA_20'].iloc[-2]
+                            previous_sma15 = weekly_data['SMA_15'].iloc[-2]
+                            if (previous_sma20 < previous_sma15):
+                                golden_cross_recent = True
+                                break # Found a golden cross this week
+
+
+
+                # 3. The latest weekly closing price is higher than its opening price and the gain is not excessive (e.g., Close <= Open * 1.05).
+                is_modest_green_candle = (latest_week['Close'] > latest_week['Open']) and \
+                                         (latest_week['Close'] <= latest_week['Open'] * 1.05)
+                # Handle cases where Open might be 0 to prevent division by zero
+                if latest_week['Open'] == 0:
+                    is_modest_green_candle = False
+
+
+                # 4. The latest weekly volume is at least 1.5 times the average volume of the previous 8 weeks.
+                # Need at least 9 weeks of data (latest + 8 prior)
+                if len(weekly_data) < 9:
+                    stock_meets_all_conditions = False
+                    break
+
+                prior_8_weeks_volume_data = weekly_data.iloc[-9:-1] # Volume for 8 weeks before latest
+                prior_8_weeks_avg_volume = prior_8_weeks_volume_data['Volume'].mean()
+
+                is_volume_confirmed = False
+                if not pd.isna(prior_8_weeks_avg_volume) and prior_8_weeks_avg_volume > 0:
+                    is_volume_confirmed = (latest_week['Volume'] >= (prior_8_weeks_avg_volume * 1.5))
+
+
+                if is_above_sma15 and golden_cross_recent and is_modest_green_candle and is_volume_confirmed:
+                    condition_met = True
+
+            elif condition_key == "s7_recent_red_k_bar":
+                # Ensure enough data to check at least the previous week
+                if len(weekly_data) < 2:
+                    stock_meets_all_conditions = False
+                    break
+
+                # Check if latest week or previous week is a red K-bar
+                is_latest_week_red_k = latest_week['Close'] > latest_week['Open']
+                is_previous_week_red_k = previous_week['Close'] > previous_week['Open']
+
+                if is_latest_week_red_k or is_previous_week_red_k:
+                    condition_met = True
+
+            elif condition_key == "s_macd_slowly_climbing":
+                # Check if all required MACD values are available
+                if ('MACD_Line' not in weekly_data.columns or 'Signal_Line' not in weekly_data.columns or
+                    'MACD_Histogram' not in weekly_data.columns):
+                    stock_meets_all_conditions = False
+                    break
+
+                # Ensure enough data points for checking 'slowly climbing' over 3 weeks
+                if len(weekly_data) < 3:
+                    stock_meets_all_conditions = False
+                    break
+
+                # MACD線在過去至少3週內持續向上
+                # Check current week and previous 2 weeks (total 3 weeks)
+                macd_series = weekly_data['MACD_Line'].iloc[-3:]
+                is_macd_climbing = all(macd_series.diff().dropna() > 0)
+
+                # 最新一週的MACD線值高於Signal線值
+                is_macd_above_signal = latest_week['MACD_Line'] > latest_week['Signal_Line']
+
+                # 同時MACD柱狀圖為正值
+                is_macd_histogram_positive = latest_week['MACD_Histogram'] > 0
+
+                if is_macd_climbing and is_macd_above_signal and is_macd_histogram_positive:
+                    condition_met = True
+
+            # If any selected condition is NOT met, this stock fails the overall screening
+            if not condition_met:
+                stock_meets_all_conditions = False
+                break
+
+        # If all selected conditions are met, add the stock code to the list
+        if stock_meets_all_conditions:
+            filtered_stock_codes.append(stock_code)
+
+    # 4. 根據收集到的股票代號，從 df_technical_data 中篩選出最終符合條件的股票DataFrame並返回。
+    final_filtered_stocks = df_technical_data[df_technical_data['股票代號'].isin(filtered_stock_codes)].copy()
+    return final_filtered_stocks
+
+# --- Initialize Global Variables and Interactive Widgets ---
+
+# Initialize global variables for first run and to be used by the functions
+extracted_stock_info = pd.DataFrame()
+df_technical_data = pd.DataFrame()
+all_filtered_stocks_for_display = pd.DataFrame()
+all_weekly_data_dfs = {}
+global_selected_conditions_for_plot = [] # New global variable to store selected conditions for plotting
+
+# Scrape stock categories and initialize dropdown
+url = "https://isin.twse.com.tw/isin/class_i.jsp?kind=1"
+response = requests.get(url)
+stock_categories = []
+
+if response.status_code == 200:
+    soup = BeautifulSoup(response.text, 'html.parser')
+    select_tag = soup.find('select', {'name': 'industry_code'})
+
+    if select_tag:
+        option_tags = select_tag.find_all('option')
+        for option in option_tags:
+            category = option.get_text(strip=True)
+            if category:
+                stock_categories.append(category)
+    else:
+        print("錯誤: 無法找到名稱為 'industry_code' 的 <select> 標籤。")
+elif response.status_code == 403:
+    print(f"錯誤: 拒絕訪問。狀態碼: {response.status_code}。請檢查IP是否被阻擋或嘗試稍後重試。")
+else:
+    print(f"無法檢索網頁。狀態碼: {response.status_code}")
+
+# Add "全部上市" to the beginning of the list
+stock_categories.insert(0, '全部上市')
+
+dropdown = widgets.Dropdown(
+    options=stock_categories,
+    value='06.電器電纜', # Set default value back to a specific category
+    description='產業別:',
+    disabled=False,
+)
+
+# Setup price range slider
+price_range_slider = widgets.IntRangeSlider(
+    value=[10, 50],
+    min=0,
+    max=50,
+    step=1,
+    description='價格區間:',
+    disabled=False,
+    continuous_update=False,
+    orientation='horizontal',
+    readout=True,
+    readout_format='d',
+)
+
+# Placeholder for stock selection dropdown and interactive plot output
+stock_selection_dropdown_all = widgets.Dropdown(
+    options=[],
+    description='選擇股票:',
+    disabled=False,
+)
+
+# Create an Output widget to capture and display the output of full_interactive_update
+interactive_output_area = widgets.Output()
+
+# Create a separate output widget specifically for the progress bar
+progress_output_area = widgets.Output()
+
+# Create a separate output widget for the plot to control updates explicitly
+plot_output_area = widgets.Output()
+
+# Define All Condition Metadata
+all_conditions_metadata = [
+    {
+        "key": "price_range",
+        "display_name": "價格區間篩選",
+        "description": "股票的最新週收盤價必須在用戶設定的最低價格 (min_price) 和最高價格 (max_price) 之間。"
+    },
+    {
+        "key": "s1_downward_gap_unfilled",
+        "display_name": "策略一: 向下跳空破口未回補",
+        "description": "歷史上存在一個向下跳空破口，其大小至少為10%（開盤價低於前一週最低價，且(前一週最低價 - 當週開盤價) / 前一週收盤價 >= 0.10），並且從破口形成當週到最新一週，所有後續週的最高價都未高於破口範圍的上限（即破口未被回補）。"
+    },
+    {
+        "key": "s2_volume_increasing",
+        "display_name": "策略二: 成交量持續放大 (最近3週)",
+        "description": "最近一週的成交量高於前一週的成交量，且前一週的成交量高於前兩週的成交量。"
+    },
+    {
+        "key": "s2_above_20sma",
+        "display_name": "策略二: 股價站穩20週均線之上",
+        "description": "最新一週的收盤價必須高於其20週移動平均線。"
+    },
+    {
+        "key": "s2_red_candlestick",
+        "display_name": "策略二: K線形態為紅K線",
+        "description": "最新一週的收盤價高於其開盤價。"
+    },
+    {
+        "key": "s3_current_bb_squeeze",
+        "display_name": "策略三: 最新一週布林通道緊縮",
+        "description": "最新一週的布林通道寬度（上緣減下緣）相對於最新收盤價的比例小於 5%，以識別股價處於盤整狀態。"
+    },
+    {
+    "key": "s4_12w_consolidation_no_recent_surge",
+    "display_name": "策略四: 12週持續盤整 (排除近期大漲)",
+    "description": "過去 12 週 (不含最新一週) 的最高價和最低價，相對於最新週收盤價的波動幅度在 10% 以內，且最新週收盤價相較於三週前的收盤價漲幅不超過 10%。"
+},
+{
+    "key": "s5_double_bottom_red_k_unbroken_high",
+    "display_name": "策略五: 雙重底紅K未突破高點",
+    "description": "尋找 '第二個底部' (B2) 的K棒，其為最近五週內 (不含最新一週) '最低價' 最低的K棒，且為紅K線，下影線長度至少為K棒實體部分的 50%。然後確認從 B2 K棒之後所有K棒的 '最高價' 都未高於 B2 的 '最高價'，且 B2 的最低價需小於或等於其布林通道下緣的 1.01 倍。接著尋找 '第一個底部' (B1) 的K棒，其為從 26 週前到 B2 之前 '最低價' 最低的K棒，且 B1 的最低價需小於或等於其布林通道下緣的 1.01 倍。最後，確認 B1 和 B2 的 '最低價' 在 5% 的波動範圍內，且兩者之間至少間隔 3 週。此外，B1 和 B2 之間的K棒 (不含 B1 和 B2 本身) 的 '實體高點' (開盤價和收盤價中較高的價格) 都必須小於或等於其對應的 20 週移動平均線。此外，最新一週的15週移動平均線在過去6週內不得呈現下降趨勢。此策略需要至少 27 週的歷史數據。"
+},
+{
+    "key": "s6_momentum_for_potential_gain",
+    "display_name": "策略六: 上漲動能初顯 (潛力股)",
+    "description": "最新一週的收盤價高於其15週移動平均線，且20週移動平均線在最近5週內（含當週）向上穿越15週移動平均線。同時，最新一週為小紅K線（收盤價高於開盤價，且漲幅不超過5%），並且成交量至少是前8週平均成交量的1.5倍。此策略旨在識別具有潛在向上動能的股票。"
+},
+{
+    "key": "s7_recent_red_k_bar",
+    "display_name": "策略七: 最近二週至少一根紅K棒",
+    "description": "最近一週或前一週（或兩者皆是）為紅K線（收盤價高於開盤價）。"
+},
+{
+    "key": "s_macd_slowly_climbing",
+    "display_name": "策略八: MACD 正在緩步爬升",
+    "description": "MACD線在過去至少3週內持續向上，且最新一週的MACD線值高於Signal線值，同時MACD柱狀圖為正值。此策略旨在識別MACD處於健康上升趨勢，但尚未過度超漲的股票。"
+}
+]
+
+# Create Checkbox Widgets
+checkbox_widgets = []
+for condition in all_conditions_metadata:
+    checkbox = widgets.Checkbox(
+        value=False,
+        description=condition['display_name'],
+        disabled=False,
+        indent=False
+    )
+    checkbox_widgets.append(checkbox)
+
+# Wrap checkboxes in a VBox for vertical display
+condition_selection_vbox = widgets.VBox(checkbox_widgets)
+
+# Define the execute_filter_button widget
+execute_filter_button = widgets.Button(
+    description='執行篩選',
+    disabled=False,
+    button_style='success', # 'success', 'info', 'warning', 'danger' or ''
+    tooltip='點擊執行篩選',
+    icon='check' # (FontAwesome names)
+)
+
+# --- Define and Link Main Interactive Update Function ---
+
+def full_interactive_update(_=None):
+    global all_filtered_stocks_for_display
+    global df_technical_data
+    global extracted_stock_info
+    global all_weekly_data_dfs
+    global all_conditions_metadata
+    global global_selected_conditions_for_plot # Declare access to the global variable
+
+    selected_category_val = dropdown.value
+    min_price_val, max_price_val = price_range_slider.value
+
+    # Change button style to 'danger' (red), disable it, and change description when processing starts
+    execute_filter_button.button_style = 'danger'
+    execute_filter_button.description = '篩選中...'
+    execute_filter_button.disabled = True # Disable the button
+
+    try:
+        with interactive_output_area:
+            clear_output(wait=True)
+
+            # Collect selected condition keys from checkboxes
+            selected_condition_keys = []
+            for i, checkbox in enumerate(checkbox_widgets):
+                if checkbox.value:
+                    selected_condition_keys.append(all_conditions_metadata[i]['key'])
+
+            global_selected_conditions_for_plot = selected_condition_keys.copy() # Store selected conditions globally
+
+            # --- Debug Print --- START
+            print(f"偵錯：已選擇的條件鍵值為: {selected_condition_keys}")
+            # --- Debug Print --- END
+
+            if not selected_condition_keys:
+                print("錯誤：請至少選擇一個篩選條件。")
+                all_filtered_stocks_for_display = pd.DataFrame(columns=['項次', '股票代號', '股票名稱'])
+                # Clear stock selection dropdown
+                stock_selection_dropdown_all.options = []
+                stock_selection_dropdown_all.value = None
+                # Also clear the plot output area explicitly if no conditions are selected
+                with plot_output_area:
+                    clear_output(wait=True)
+                return
+
+            # --- Contradiction Check --- START
+            # Define contradictory sets of conditions. If any two conditions from a set are selected, it's a contradiction.
+            contradictory_rules = [
+                {"s1_downward_gap_unfilled", "s2_above_20sma"},
+                {"s1_downward_gap_unfilled", "s3_current_bb_squeeze"},
+                {"s1_downward_gap_unfilled", "s6_momentum_for_potential_gain"},
+                {"s4_12w_consolidation_no_recent_surge", "s6_momentum_for_potential_gain"}
+            ]
+
+            has_contradiction = False
+            for rule in contradictory_rules:
+                # Check if any two conditions from the rule are present in selected_condition_keys
+                if len(set(selected_condition_keys).intersection(rule)) >= 2:
+                    conflicting_conditions = set(selected_condition_keys).intersection(rule)
+                    conflicting_names = [next(item['display_name'] for item in all_conditions_metadata if item['key'] == k) for k in conflicting_conditions]
+                    print(f"錯誤：您選擇的條件之間存在矛盾！'{conflicting_names[0]}' 與 '{conflicting_names[1]}' 無法同時成立。請調整您的選擇。")
+                    has_contradiction = True
+                    break
+
+            if has_contradiction:
+                all_filtered_stocks_for_display = pd.DataFrame(columns=['項次', '股票代號', '股票名稱'])
+                stock_selection_dropdown_all.options = []
+                stock_selection_dropdown_all.value = None
+                with plot_output_area:
+                    clear_output(wait=True)
+                return # Exit the function early
+            # --- Contradiction Check --- END
+
+            # If no contradictions and selections are not empty, proceed with actual data processing message.
+            print(f"正在更新數據... 產業別: {selected_category_val}, 價格區間: {min_price_val}-{max_price_val}") # Moved here
+            print("\n1. 開始獲取股票列表及歷史週數據...")
+            display(progress_output_area) # Display the dedicated progress output widget
+            extracted_stock_info, df_technical_data, all_weekly_data_dfs = get_and_process_stock_data(selected_category_val)
+
+            if extracted_stock_info.empty:
+                print("未能從 ISIN 網站獲取股票資訊。")
+                all_filtered_stocks_for_display = pd.DataFrame(columns=['項次', '股票代號', '股票名稱'])
+            elif df_technical_data.empty:
+                print("未能獲取到該產業別的有效股票技術指標數據。")
+                all_filtered_stocks_for_display = pd.DataFrame(columns=['項次', '股票代號', '股票名稱'])
+            else:
+                print(f"2. 該產業別共有 {len(extracted_stock_info)} 支股票資訊，成功獲取 {len(df_technical_data)} 支股票的技術指標及歷史數據.")
+
+                # Print currently applied filters
+                applied_filter_names = [key_data['display_name'] for key_data in all_conditions_metadata if key_data['key'] in selected_condition_keys]
+                print(f"3. 正在應用以下篩選條件: {', '.join(applied_filter_names)}...")
+
+                # Use the dynamic_stock_screener instead of strategy_one/two/three
+                current_filtered_stocks = dynamic_stock_screener(selected_condition_keys, df_technical_data, all_weekly_data_dfs, min_price_val, max_price_val)
+
+                if not current_filtered_stocks.empty:
+                    all_filtered_stocks_for_display = pd.merge(
+                        current_filtered_stocks,
+                        extracted_stock_info[['項次', '股票代號', '股票名稱']],
+                        on='股票代號',
+                        how='inner'
+                    )
+                    all_filtered_stocks_for_display = all_filtered_stocks_for_display[[
+                        '項次',
+                        '股票代號',
+                        '股票名稱',
+                        '最新週收盤價',
+                        '最新週成交量(張)'
+                    ]].copy()
+                else:
+                    all_filtered_stocks_for_display = pd.DataFrame(columns=['項次', '股票代號', '股票名稱', '最新週收盤價', '最新週成交量(張)'])
+
+            dropdown_options = [
+                f"{row['股票代號']} - {row['股票名稱']}"
+                for index, row in all_filtered_stocks_for_display.iterrows()
+            ]
+
+            # Explicitly set value to None before updating options to prevent TraitError
+            # if the new options list is empty and the old value is no longer valid.
+            stock_selection_dropdown_all.value = None
+            stock_selection_dropdown_all.options = dropdown_options
+
+            # Now set the value based on the new options
+            if dropdown_options:
+                stock_selection_dropdown_all.value = dropdown_options[0]
+            else:
+                # If no stocks, also clear the plot output area
+                with plot_output_area:
+                    clear_output(wait=True)
+
+            print(f"\n4. 篩選後的股票列表 ({len(all_filtered_stocks_for_display)} 支)：")
+            display(all_filtered_stocks_for_display)
+            print("5. 更新完成，請從 '選擇股票' 下拉選單中選擇股票以查看K線圖。劉總裁您好！")
+
+    finally:
+        # Change button style back to 'success' (green), enable it, and change description
+        execute_filter_button.button_style = 'success'
+        execute_filter_button.description = '執行篩選'
+        execute_filter_button.disabled = False # Re-enable the button
+
+# Define the observer function for stock_selection_dropdown_all.value
+def on_stock_selection_change(change):
+    with plot_output_area:
+        clear_output(wait=True)
+        stock_selection_string = change.new
+        if stock_selection_string:
+            fig = plot_candlestick_chart(stock_selection_string)
+            if fig:
+                display(fig.canvas)
+            else:
+                # Added explicit feedback when plot_candlestick_chart returns None
+                stock_code = stock_selection_string.split(' - ')[0]
+                print(f"未能為 {stock_code} 繪製K線圖。可能原因：數據不足、選取的MACD條件數據不完整或繪圖過程中發生錯誤。")
+        else:
+            print("請選擇一支股票來繪製K線圖。") # Keep user-facing message
+
+# --- FIX: Prevent multiple observers from being attached ---
+try:
+    # Attempt to unobserve the function first to prevent multiple bindings if the cell is run multiple times
+    stock_selection_dropdown_all.unobserve(on_stock_selection_change, names='value')
+except ValueError:
+    # If it was never observed before, unobserve will raise a ValueError, which is fine.
+    pass
+# Attach the observer to the dropdown's value trait
+stock_selection_dropdown_all.observe(on_stock_selection_change, names='value')
+
+# Attach full_interactive_update to the button's click event
+execute_filter_button.on_click(full_interactive_update)
+
+# Group input widgets together for persistent display
+input_widgets_container = widgets.VBox([
+    dropdown,
+    price_range_slider,
+    condition_selection_vbox,
+    execute_filter_button,
+    stock_selection_dropdown_all
+])
+
+# New main container to hold all UI elements in a single displayed widget
+main_ui_container = widgets.VBox([
+    input_widgets_container,
+    interactive_output_area,
+    plot_output_area
+])
+
+# Display the single main container holding all interactive components and their outputs
+display(main_ui_container)
+
+# Dynamically generate the HTML for conditions based on all_conditions_metadata
+html_content = """<h3>選股條件說明</h3>\n<p>現在您可以透過選擇多個條件來組合您的篩選策略。請從下方的複選框中勾選您希望應用的條件。當條件被勾選時，會會自動觸發篩選更新。</p>\n<ul>\n"""
+
+for condition in all_conditions_metadata:
+    html_content += f"<li><b>{condition['display_name']}:</b> {condition['description']}</li>\n"
+html_content += "</ul>"
+
+# Display the new HTML content
+display(widgets.HTML(value=html_content))
+
+# Initial call to update the displayed stocks when the notebook starts
+full_interactive_update()
